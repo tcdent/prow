@@ -1,0 +1,17 @@
+[package]
+name = "prow"
+version = "0.1.0"
+edition = "2021"
+description = "Profiling rows: structured, timestamped measurements from a program and its devices, stored per site per run and queried with SQL."
+license = "MIT"
+publish = false
+
+# The client: hooks, the sender, the shared protocol, clocks, build identity. std and libc only,
+# so it builds static (musl) and goes anywhere. No features: a hook's category is a feature of
+# the crate that calls it.
+[dependencies]
+libc = "0.2"
+
+[workspace]
+members = [".", "server", "demo"]
+default-members = [".", "server", "demo"]

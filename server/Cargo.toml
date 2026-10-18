@@ -1,0 +1,19 @@
+[package]
+name = "prow-server"
+version = "0.1.0"
+edition = "2021"
+description = "Receives prow runs and writes them as Parquet, one table per site per run."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "prow-server"
+path = "src/main.rs"
+
+[dependencies]
+arrow-array = "60.0.0"
+arrow-schema = "60.0.0"
+libc = "0.2"
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
+prow = { path = ".." }
+serde_json = "1.0.154"

@@ -1,0 +1,75 @@
+/* prow — dark only: gray on a dark ground, a few subject colours, monospace. */
+:root {
+  --bg: #0e1014;
+  --panel: #14171d;
+  --rule: #262b35;
+  --gray: #555d6d;
+  --text: #c6cbd4;
+  --bright: #f2f4f7;
+  --teal: #4acdba;
+  --red: #e0524f;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--mono); }
+a { color: inherit; text-decoration: none; }
+a:hover { color: var(--bright); }
+.dim { color: var(--gray); }
+.warn { color: var(--red); }
+
+.top { display: flex; align-items: baseline; gap: 18px; padding: 14px 22px; border-bottom: 1px solid var(--rule); color: var(--gray); }
+.top .brand { color: var(--bright); font-weight: 600; letter-spacing: 0.02em; }
+.top .crumb { color: var(--text); }
+.top .right { margin-left: auto; display: flex; gap: 14px; }
+.page { padding: 18px 22px 60px; }
+.empty { color: var(--gray); padding: 30px 0; }
+
+.project { margin: 0 0 30px; }
+.project .rule { display: flex; align-items: baseline; gap: 14px; padding: 6px 0; border-bottom: 1px solid var(--rule); margin-bottom: 6px; }
+.project .rule .name { color: var(--bright); font-weight: 600; font-size: 14px; }
+
+table.stats { border-collapse: collapse; width: 100%; margin: 6px 0 14px; }
+table.stats th { text-align: left; color: var(--gray); font-weight: normal; padding: 4px 8px; border-bottom: 1px solid var(--rule); }
+table.stats td { padding: 3px 8px; white-space: nowrap; }
+table.stats td.num, table.stats th:not(:first-child):not(:nth-child(2)) { text-align: right; font-variant-numeric: tabular-nums; }
+table.stats tbody tr { cursor: pointer; }
+table.stats tbody tr:hover td { color: var(--bright); background: var(--panel); }
+table.stats tr.on td { color: var(--teal); }
+table.runs th, table.runs td { text-align: left !important; }
+
+.run h1 { font-size: 15px; font-weight: 600; color: var(--bright); margin: 0 0 4px; }
+.run h1 .dim { font-weight: normal; }
+.facts { color: var(--gray); display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 2px 0 6px; }
+details.attrs { margin: 0 0 12px; color: var(--gray); }
+details.attrs summary { cursor: pointer; }
+details.attrs table td { padding: 1px 12px 1px 0; color: var(--text); }
+details.attrs table td.dim { color: var(--gray); }
+
+.viewbar { display: flex; align-items: baseline; gap: 12px; margin: 8px 0; }
+.viewbar .hint { margin-left: auto; }
+button { background: var(--panel); border: 1px solid var(--rule); color: var(--gray); padding: 3px 10px; border-radius: 4px; font: inherit; cursor: pointer; }
+button:hover, button.on { color: var(--bright); border-color: var(--gray); }
+select { background: var(--panel); border: 1px solid var(--rule); color: var(--text); font: inherit; border-radius: 4px; padding: 2px 4px; }
+
+.overview, .flamechart, .flamegraph, .chart-box { position: relative; user-select: none; }
+.overview { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; }
+.flamechart { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 4px 10px 6px; margin-bottom: 14px; }
+.overview canvas, .flamechart canvas, .flamegraph canvas, .chart-box canvas { display: block; cursor: crosshair; }
+.flamegraph canvas { cursor: pointer; }
+
+.tabs { display: flex; gap: 6px; margin: 4px 0 10px; flex-wrap: wrap; }
+.tabs .focus { margin-left: auto; color: var(--teal); }
+
+.tip { position: absolute; pointer-events: none; z-index: 5; background: #1b1f27; border: 1px solid var(--rule); border-radius: 4px; padding: 5px 9px; max-width: 260px; white-space: nowrap; }
+.tip .title { color: var(--bright); overflow: hidden; text-overflow: ellipsis; }
+
+.chart { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 12px 6px; margin-bottom: 12px; }
+.chart .head { display: flex; align-items: baseline; gap: 10px; color: var(--gray); margin-bottom: 4px; }
+.chart .head .title { color: var(--text); }
+.chart .head .now { margin-left: auto; color: var(--bright); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr)); gap: 0 12px; }
+.legend { display: flex; gap: 14px; color: var(--gray); margin-bottom: 2px; }
+.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 1px; margin-right: 5px; }
+
+.site .controls { display: flex; align-items: baseline; gap: 16px; margin-bottom: 8px; color: var(--gray); }
+.ranges { display: inline-flex; gap: 6px; }

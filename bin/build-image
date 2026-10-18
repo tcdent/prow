@@ -1,0 +1,11 @@
+#!/bin/bash
+# build-image: the static prow-server, the web app, and the image $PROW_IMAGE:<version> (default
+# prow-server; <version> from server/Cargo.toml). Set PROW_IMAGE to your registry's path to push it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' server/Cargo.toml | head -1)
+cargo build --release --target x86_64-unknown-linux-musl -p prow-server
+(cd web && bun install --frozen-lockfile && bun run build)
+image=${PROW_IMAGE:-prow-server}:$version
+podman build -f Containerfile -t "$image" .
+echo "built $image"

@@ -1,0 +1,28 @@
+#!/bin/bash
+# prow-sql: DuckDB over a prow data tree (an in-memory session whose views read the files).
+#   prow-sql                         list projects
+#   prow-sql <project>               interactive session
+#   prow-sql <project> "<SQL>"       one query, printed as a table
+#
+# Views: `runs` (one row per run: its manifest, every attribute a column) and one view per site,
+# named by the site (`step`, `zones`, `plots`, `messages`, ...), over every run of the project.
+# Every site view has `ts` (UTC) and `run` (the run id) besides the site's fields; join a site
+# to `runs` on `run`. A field absent from a run's schema reads as NULL in that run's rows.
+#
+# PROW_DATA: the data tree (default ~/prow/data). DUCKDB: the duckdb binary (default `duckdb`).
+set -euo pipefail
+DATA=${PROW_DATA:-$HOME/prow/data}
+DUCKDB=${DUCKDB:-duckdb}
+if [ $# -eq 0 ]; then
+    ls -d "$DATA"/project=* 2>/dev/null | sed 's|.*/project=||'; exit 0
+fi
+project=$1; shift
+root="$DATA/project=$project"
+[ -d "$root" ] || { echo "prow-sql: no project '$project' in $DATA" >&2; exit 1; }
+
+init="SET TimeZone = 'UTC'; CREATE VIEW runs AS SELECT * FROM read_json('$root/run=*/manifest.json', union_by_name = true, format = 'auto');"
+for site in $(ls -d "$root"/run=*/*/ 2>/dev/null | xargs -rn1 basename | sort -u); do
+    init+=" CREATE VIEW \"$site\" AS SELECT * EXCLUDE (project) FROM read_parquet('$root/run=*/$site/*.parquet', hive_partitioning = true, union_by_name = true);"
+done
+if [ $# -eq 0 ]; then exec "$DUCKDB" -cmd "$init"; fi
+exec "$DUCKDB" -cmd "$init" -c "$1"
