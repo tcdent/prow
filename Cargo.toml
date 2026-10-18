@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Profiling rows: structured, timestamped measurements from a program and its devices, stored per site per run and queried with SQL."
 license = "MIT"
-publish = false
+repository = "https://github.com/tcdent/prow"
+readme = "README.md"
+keywords = ["profiling", "profiler", "instrumentation", "parquet", "telemetry"]
+categories = ["development-tools::profiling"]
+# the crate is the client; the server, web app and demo live in the repository
+include = ["/src/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 # The client: hooks, the sender, the shared protocol, clocks, build identity. std and libc only,
 # so it builds static (musl) and goes anywhere. No features: a hook's category is a feature of
