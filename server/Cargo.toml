@@ -13,7 +13,8 @@ path = "src/main.rs"
 [dependencies]
 arrow-array = "60.0.0"
 arrow-schema = "60.0.0"
+duckdb = { version = "1.10506.1", features = ["bundled", "parquet", "json"] }
 libc = "0.2"
-parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap", "zstd"] }
 prow = { path = ".." }
 serde_json = "1.0.154"

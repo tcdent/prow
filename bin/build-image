@@ -1,11 +1,25 @@
 #!/bin/bash
-# build-image: the static prow-server, the web app, and the image $PROW_IMAGE:<version> (default
-# prow-server; <version> from server/Cargo.toml). Set PROW_IMAGE to your registry's path to push it.
+# build-image: prow-server (DuckDB embedded), the web app, and the image $PROW_IMAGE:<tag> (default image
+# prow-server). A deploy is tagged <version>-dev.<UTC time> (<version> from server/Cargo.toml), so
+# redeploys never touch the version; PROW_TAG=<tag> names the tag instead (a release: the version).
+# Prints the tag on its last line. Set PROW_IMAGE to your registry's path to push it, and PROW_BASE
+# to pull the Debian base image from somewhere other than Docker Hub.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' server/Cargo.toml | head -1)
-cargo build --release --target x86_64-unknown-linux-musl -p prow-server
+tag=${PROW_TAG:-$version-dev.$(date -u +%Y%m%d.%H%M%S)}
+cargo build --release -p prow-server
+# DuckDB's ICU extension (time zones: TIMESTAMPTZ arithmetic, AT TIME ZONE), for the embedded
+# DuckDB's exact version; DuckDB checks its signature when the server loads it
+duckdb=v1.5.6   # the `duckdb` crate's DuckDB: keep in step with server/Cargo.toml
+icu=server/extensions/icu.duckdb_extension
+if [ ! -f "$icu" ]; then
+    mkdir -p server/extensions
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > server/extensions/CACHEDIR.TAG
+    curl -fsSL "https://extensions.duckdb.org/$duckdb/linux_amd64/icu.duckdb_extension.gz" | gunzip > "$icu"
+fi
 (cd web && bun install --frozen-lockfile && bun run build)
-image=${PROW_IMAGE:-prow-server}:$version
-podman build -f Containerfile -t "$image" .
+image=${PROW_IMAGE:-prow-server}:$tag
+podman build -f Containerfile --build-arg BASE="${PROW_BASE:-debian:bookworm-slim}" -t "$image" .
 echo "built $image"
+echo "$tag"

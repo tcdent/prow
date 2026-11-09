@@ -1,4 +1,4 @@
-// Charts over the view: a value over time (lines or dots, coloured by a label) and a histogram.
+// Charts over the view: a value over time (lines or dots, colored by a label) and a histogram.
 // A drag on a time chart selects that span as the view, as on the flame chart.
 
 import { useCallback, useMemo, useRef, useState } from "react";
@@ -113,25 +113,23 @@ export function TimeChart({ points, view, setView, mode, unit }: { points: Point
   );
 }
 
-export function Histogram({ points, unit }: { points: Point[]; unit?: (v: number) => string }) {
+/** Bins counted by the server: `counts[group][bin]` over [lo, hi]. */
+export interface Bins { lo: number; hi: number; groups: string[]; counts: number[][] }
+export const BINS = 48;
+
+export function Histogram({ data, unit }: { data: Bins; unit?: (v: number) => string }) {
   const box = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const w = useWidth(box);
   const pw = Math.max(w - LEFT, 1), ph = H - BOTTOM;
   const fmtV = unit ?? num;
-  const groups = useMemo(() => [...new Set(points.map((p) => p.g))].sort(), [points]);
-  const BINS = 48;
-  const { lo, hi, counts, peak } = useMemo(() => {
-    const [lo, hi] = extent(points.map((p) => p.v));
-    const counts = groups.map(() => new Uint32Array(BINS));
-    for (const p of points) {
-      const b = Math.min(BINS - 1, Math.max(0, Math.floor(((p.v - lo) / (hi - lo || 1)) * BINS)));
-      counts[groups.indexOf(p.g)][b]++;
-    }
-    let peak = 1;
-    for (let b = 0; b < BINS; b++) peak = Math.max(peak, counts.reduce((s, c) => s + c[b], 0));
-    return { lo, hi, counts, peak };
-  }, [points, groups]);
+  const { lo, groups, counts } = data;
+  const hi = data.hi > data.lo ? data.hi : data.lo + 1;
+  const peak = useMemo(() => {
+    let p = 1;
+    for (let b = 0; b < BINS; b++) p = Math.max(p, counts.reduce((s, c) => s + (c[b] ?? 0), 0));
+    return p;
+  }, [counts]);
   const [hover, setHover] = useState<{ b: number; x: number; y: number } | null>(null);
 
   const draw = useCallback(

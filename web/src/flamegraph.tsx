@@ -1,16 +1,32 @@
 // The flame graph of the view: zones merged by their stack (lane, then the names they nest in),
-// each frame as wide as its time inside the view. Click a frame to focus it, the top bar to go back.
+// each frame as wide as its time inside the view. The server walks every zone of the range (exact
+// at any zoom: GET /api/flame); click a frame to focus it, the top bar to go back.
 
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { Run } from "./api";
 import { useCanvas, useWidth } from "./canvas";
 import { colorOf, css, dur, GRAY } from "./fmt";
+import { tracked, useQuery } from "./sql";
 import type { View } from "./timeline";
 
 interface Node { name: string; total: number; count: number; children: Map<string, Node> }
-const node = (name: string): Node => ({ name, total: 0, count: 0, children: new Map() });
+interface Wire { name: string; total: number; count: number; children: Wire[] }
 
 const ROW = 17;
+
+const toNode = (w: Wire): Node => ({ name: w.name, total: w.total, count: w.count, children: new Map(w.children.map((c) => [c.name, toNode(c)])) });
+
+async function loadFlame(run: Run, view: View, signal: AbortSignal): Promise<Node> {
+  const qs = new URLSearchParams({ project: run.project, run: run.id, from: (run.t0 + view.from).toFixed(0), to: (run.t0 + view.to).toFixed(0) });
+  return tracked(
+    (async () => {
+      const res = await fetch(`/api/flame?${qs}`, { signal });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ?? `${res.status}`);
+      return toNode(body.root as Wire);
+    })(),
+  );
+}
 
 export function FlameGraph({ run, view, onPick }: { run: Run; view: View; onPick: (name: string | null) => void }) {
   const box = useRef<HTMLDivElement>(null);
@@ -19,34 +35,8 @@ export function FlameGraph({ run, view, onPick }: { run: Run; view: View; onPick
   const [focusPath, setFocusPath] = useState<string[]>([]);
   const [hover, setHover] = useState<{ n: Node; x: number; y: number; share: number } | null>(null);
 
-  const root = useMemo(() => {
-    const r = node("all");
-    const paths = new Map<number, string[]>();
-    const path = (i: number): string[] => {
-      let p = paths.get(i);
-      if (p) return p;
-      const z = run.zones[i];
-      p = z.parent < 0 ? [z.lane, z.name] : [...path(z.parent), z.name];
-      paths.set(i, p);
-      return p;
-    };
-    run.zones.forEach((z, i) => {
-      const clipped = Math.min(z.t + z.dur, view.to) - Math.max(z.t, view.from);
-      if (clipped <= 0) return;
-      let n = r;
-      const p = path(i);
-      // a lane's own total is its depth-0 zones' time, added below
-      for (const name of p) {
-        if (!n.children.has(name)) n.children.set(name, node(name));
-        n = n.children.get(name)!;
-      }
-      n.total += clipped;
-      n.count += 1;
-      if (z.depth === 0) r.children.get(z.lane)!.total += clipped;
-    });
-    r.total = [...r.children.values()].reduce((s, c) => s + c.total, 0);
-    return r;
-  }, [run, view]);
+  const { data } = useQuery(`flame:${run.id}:${view.from.toFixed(0)}:${view.to.toFixed(0)}`, (signal) => loadFlame(run, view, signal), 200);
+  const root = data ?? { name: "all", total: 0, count: 0, children: new Map<string, Node>() };
 
   let focus = root;
   for (const name of focusPath) focus = focus.children.get(name) ?? focus;
@@ -92,7 +82,7 @@ export function FlameGraph({ run, view, onPick }: { run: Run; view: View; onPick
   return (
     <div className="flamegraph" ref={box}>
       {root.total === 0 ? (
-        <div className="empty">no zones in the view</div>
+        <div className="empty">{data ? "no zones in the view" : ""}</div>
       ) : (
         <canvas
           ref={canvas}

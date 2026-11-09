@@ -1,28 +1,26 @@
 #!/bin/bash
-# prow-sql: DuckDB over a prow data tree (an in-memory session whose views read the files).
-#   prow-sql                         list projects
-#   prow-sql <project>               interactive session
-#   prow-sql <project> "<SQL>"       one query, printed as a table
+# prow-sql: SQL over a prow server's runs (its POST /api/sql), printed as a table.
+#   prow-sql                           list projects
+#   prow-sql <project> "<SQL>"         one query over every run of the project
+#   prow-sql <project> <run> "<SQL>"   one query over one run's files (faster: by its id)
+#   prow-sql <project> < query.sql     the SQL from stdin
 #
-# Views: `runs` (one row per run: its manifest, every attribute a column) and one view per site,
-# named by the site (`step`, `zones`, `plots`, `messages`, ...), over every run of the project.
-# Every site view has `ts` (UTC) and `run` (the run id) besides the site's fields; join a site
-# to `runs` on `run`. A field absent from a run's schema reads as NULL in that run's rows.
+# Views: `runs` (one row per run: its manifest, every attribute a column) and one view per site
+# (`step`, `zones`, `plots`, `messages`, ...) with `ts` (UTC), `run` and the site's fields. Join a
+# site to `runs` on `run`. A field absent from a run's schema reads NULL in that run's rows.
+# `queries` is the server's query log. Only SELECT statements are run, for at most 60 s; the
+# server reads its data directory and nothing else.
 #
-# PROW_DATA: the data tree (default ~/prow/data). DUCKDB: the duckdb binary (default `duckdb`).
+# PROW_URL: the server's HTTP side, e.g. http://10.0.0.2:7381 (no default).
 set -euo pipefail
-DATA=${PROW_DATA:-$HOME/prow/data}
-DUCKDB=${DUCKDB:-duckdb}
+URL=${PROW_URL:?set PROW_URL to the prow server, e.g. http://10.0.0.2:7381}
 if [ $# -eq 0 ]; then
-    ls -d "$DATA"/project=* 2>/dev/null | sed 's|.*/project=||'; exit 0
+    curl -fsS "$URL/api/index" | python3 -c 'import sys, json; [print(p["name"]) for p in json.load(sys.stdin)["projects"]]'
+    exit 0
 fi
 project=$1; shift
-root="$DATA/project=$project"
-[ -d "$root" ] || { echo "prow-sql: no project '$project' in $DATA" >&2; exit 1; }
-
-init="SET TimeZone = 'UTC'; CREATE VIEW runs AS SELECT * FROM read_json('$root/run=*/manifest.json', union_by_name = true, format = 'auto');"
-for site in $(ls -d "$root"/run=*/*/ 2>/dev/null | xargs -rn1 basename | sort -u); do
-    init+=" CREATE VIEW \"$site\" AS SELECT * EXCLUDE (project) FROM read_parquet('$root/run=*/$site/*.parquet', hive_partitioning = true, union_by_name = true);"
-done
-if [ $# -eq 0 ]; then exec "$DUCKDB" -cmd "$init"; fi
-exec "$DUCKDB" -cmd "$init" -c "$1"
+run=""
+if [ $# -ge 2 ]; then run=$1; shift; fi
+if [ $# -ge 1 ]; then sql=$1; else sql=$(cat); fi
+curl -sS --fail-with-body -X POST --data-binary "$sql" -H 'Content-Type: text/plain' -H 'X-Prow-Source: prow-sql' \
+    "$URL/api/sql?project=$project&run=$run&format=text"

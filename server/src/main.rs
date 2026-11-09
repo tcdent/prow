@@ -8,8 +8,12 @@
 //!
 //! Configuration, from the environment: `PROW_DATA` (default `/data`), `PROW_LISTEN` (default
 //! `0.0.0.0:7380`), `PROW_TOKEN` (optional: when set, a `HELLO` must carry it), `PROW_HTTP`
-//! (default `0.0.0.0:7381`: the web view and its files, see [`http`]), `PROW_WEB` (default
-//! `/web`: the built web app).
+//! (default `0.0.0.0:7381`: the web view and the SQL endpoint, see [`http`]), `PROW_WEB` (default
+//! `/web`: the built web app), `PROW_QUERY_MEMORY` (default `4GB`) and `PROW_QUERY_THREADS` (default
+//! 8): the embedded DuckDB's limits, `PROW_EXTENSIONS` (default `/usr/local/lib/prow/extensions`):
+//! DuckDB extensions loaded at start, ICU among them (see [`query`]). DuckDB runs in a worker
+//! process the server restarts when it crashes (see [`worker`]); every SQL request is logged to
+//! `$PROW_DATA/queries.jsonl`.
 //!
 //! Rows are buffered and written every 5 s or 100,000 rows: a part for each site with rows, so a
 //! reader sees a live run within seconds. A part is written to a hidden temporary file, synced
@@ -19,19 +23,22 @@
 //! than `durable_seq`: reopening the run deletes them, the producer sends their frames again, and
 //! frames at or below `durable_seq` are skipped. So a server crash neither loses nor repeats rows.
 //!
-//! `END` compacts each site's parts into `data.parquet` and marks the run complete. A run whose
-//! connection ends without `END` is marked `disconnected`; the producer's reconnection (the same
-//! run id) reopens it and its parts continue.
+//! `END` marks the run complete; a connection that ends without it (keepalive notices a dead
+//! producer) marks it `disconnected`. Either way the run closes: each site's parts become one
+//! zstd `data.parquet`. At start, every run left open is closed. The producer's reconnection (the
+//! same run id) reopens a run and its parts continue.
 
 mod http;
+mod query;
+mod worker;
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
@@ -40,7 +47,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::schema::types::ColumnPath;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use prow::protocol::{Attr, Frame, Hello, Rows, Schema, Type, Wire, VERSION};
@@ -69,8 +77,15 @@ fn exit_on_signals() {
 }
 
 fn main() {
-    exit_on_signals();
     let data = PathBuf::from(std::env::var("PROW_DATA").unwrap_or_else(|_| "/data".into()));
+    let memory = std::env::var("PROW_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
+    let threads = std::env::var("PROW_QUERY_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or(8);
+    let extensions = PathBuf::from(std::env::var("PROW_EXTENSIONS").unwrap_or_else(|_| "/usr/local/lib/prow/extensions".into()));
+    match std::env::args().nth(1).as_deref() {
+        Some("query-worker") => return worker::main(&data, &memory, threads, &extensions),
+        _ => {}
+    }
+    exit_on_signals();
     let listen = std::env::var("PROW_LISTEN").unwrap_or_else(|_| "0.0.0.0:7380".into());
     let token = std::env::var("PROW_TOKEN").ok().filter(|t| !t.is_empty());
     if let Err(e) = fs::create_dir_all(&data) {
@@ -87,8 +102,11 @@ fn main() {
         if token.is_some() { "token required" } else { "no token" }
     );
     let http_listen = std::env::var("PROW_HTTP").unwrap_or_else(|_| "0.0.0.0:7381".into());
-    let roots = http::Roots { data: data.clone(), web: PathBuf::from(std::env::var("PROW_WEB").unwrap_or_else(|_| "/web".into())) };
+    let queries = worker::Queries::start(&data);
+    let roots = http::Roots { data: data.clone(), web: PathBuf::from(std::env::var("PROW_WEB").unwrap_or_else(|_| "/web".into())), queries };
     std::thread::spawn(move || http::serve(&http_listen, roots));
+    let sweep_data = data.clone();
+    std::thread::spawn(move || close_idle_runs(&sweep_data));
     let cfg = Arc::new(Config { data, token });
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -104,6 +122,7 @@ fn main() {
 
 /// One connection: frames arrive from a reader thread, so flushing on a timer never splits a frame.
 fn serve(stream: TcpStream, cfg: &Config) -> io::Result<()> {
+    keepalive(&stream);
     let (tx, rx) = mpsc::channel::<io::Result<Option<Frame>>>();
     let mut reader = BufReader::new(stream.try_clone()?);
     std::thread::spawn(move || loop {
@@ -134,6 +153,7 @@ fn serve(stream: TcpStream, cfg: &Config) -> io::Result<()> {
     if !valid_name(&hello.project) {
         return refuse(&mut out, "a project name uses a-z, 0-9, '_', '.' and '-'");
     }
+    let _claim = Claim::wait(&run_id(&hello));
     let mut run = RunDir::open(&cfg.data, &hello)?;
     Frame::Ok.write_to(&mut out)?;
     eprintln!("prow-server: run {} of {} open ({} connection)", run.id, hello.project, ordinal(run.connections));
@@ -187,6 +207,7 @@ fn serve(stream: TcpStream, cfg: &Config) -> io::Result<()> {
             Frame::End => {
                 run.flush_all(&mut sites, None)?;
                 run.complete()?;
+                // the rows are on disk: the producer need not wait for the compaction
                 Frame::Ok.write_to(&mut out)?;
                 break Ok(true);
             }
@@ -202,6 +223,7 @@ fn serve(stream: TcpStream, cfg: &Config) -> io::Result<()> {
         run.disconnected()?;
     }
     eprintln!("prow-server: run {} {}", run.id, if ended { "complete" } else { "disconnected" });
+    close(&run.dir);
     result.map(|_| ())
 }
 
@@ -317,6 +339,8 @@ struct RunDir {
     durable_seq: u64,
     /// The last `ROWS` frame taken in.
     received_seq: u64,
+    /// When this connection last wrote rows (ns): a run that disconnects ended then.
+    last_flush: Option<i64>,
 }
 
 /// Manifest keys of the server's own; an attribute with one of these names is stored as `attr.<name>`.
@@ -324,7 +348,7 @@ const RESERVED: [&str; 6] = ["project", "run", "state", "opened", "ended", "conn
 
 impl RunDir {
     fn open(data: &Path, hello: &Hello) -> io::Result<RunDir> {
-        let id: String = hello.run.iter().map(|b| format!("{b:02x}")).collect();
+        let id = run_id(hello);
         let dir = data.join(format!("project={}", hello.project)).join(format!("run={id}"));
         fs::create_dir_all(&dir)?;
         let path = dir.join("manifest.json");
@@ -348,7 +372,7 @@ impl RunDir {
         let durable_seq = manifest.get("durable_seq").and_then(Json::as_u64).unwrap_or(0);
         manifest.insert("durable_seq".into(), durable_seq.into());
         drop_parts_after(&dir, durable_seq)?;
-        let run = RunDir { id, dir, manifest, connections, parts: HashMap::new(), durable_seq, received_seq: durable_seq };
+        let run = RunDir { id, dir, manifest, connections, parts: HashMap::new(), durable_seq, received_seq: durable_seq, last_flush: None };
         run.write_manifest()?;
         Ok(run)
     }
@@ -370,6 +394,7 @@ impl RunDir {
             self.flush(full, seq)?;
         }
         self.durable_seq = seq;
+        self.last_flush = Some(now_ns());
         self.manifest.insert("durable_seq".into(), seq.into());
         self.write_manifest()?;
         if let Some(out) = ack {
@@ -379,13 +404,7 @@ impl RunDir {
     }
 
     fn write_manifest(&self) -> io::Result<()> {
-        let tmp = self.dir.join(".manifest.json.tmp");
-        let mut f = fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut f, &self.manifest).map_err(io::Error::other)?;
-        f.write_all(b"\n")?;
-        f.sync_all()?;
-        fs::rename(tmp, self.dir.join("manifest.json"))?;
-        fs::File::open(&self.dir)?.sync_all()
+        write_manifest(&self.dir, &self.manifest)
     }
 
     /// Write a site's buffered rows as its next part, marked with the flush's sequence.
@@ -405,14 +424,6 @@ impl RunDir {
     }
 
     fn complete(&mut self) -> io::Result<()> {
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Err(e) = compact(&entry.path()) {
-                    eprintln!("prow-server: {}: parts left as they are: {e}", entry.path().display());
-                }
-            }
-        }
         self.manifest.insert("state".into(), "complete".into());
         self.manifest.insert("ended".into(), iso(now_ns()).into());
         self.write_manifest()
@@ -420,8 +431,116 @@ impl RunDir {
 
     fn disconnected(&mut self) -> io::Result<()> {
         self.manifest.insert("state".into(), "disconnected".into());
-        self.manifest.insert("ended".into(), iso(now_ns()).into());
+        self.manifest.insert("ended".into(), iso(self.last_flush.unwrap_or_else(now_ns)).into());
         self.write_manifest()
+    }
+}
+
+fn write_manifest(dir: &Path, manifest: &Map<String, Json>) -> io::Result<()> {
+    let tmp = dir.join(".manifest.json.tmp");
+    let mut f = fs::File::create(&tmp)?;
+    serde_json::to_writer_pretty(&mut f, manifest).map_err(io::Error::other)?;
+    f.write_all(b"\n")?;
+    f.sync_all()?;
+    fs::rename(tmp, dir.join("manifest.json"))?;
+    fs::File::open(dir)?.sync_all()
+}
+
+fn run_id(hello: &Hello) -> String {
+    hello.run.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The runs a connection or the startup sweep is working on: one at a time per run.
+static CLAIMED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static RELEASED: Condvar = Condvar::new();
+
+/// A run held by one connection or the sweep until dropped.
+struct Claim(String);
+
+impl Claim {
+    /// Wait for the run to be free: a reconnection waits for its run's compaction, or for a dead
+    /// connection to the same run to be noticed.
+    fn wait(id: &str) -> Claim {
+        let mut set = CLAIMED.lock().unwrap();
+        while set.get_or_insert_with(HashSet::new).contains(id) {
+            set = RELEASED.wait(set).unwrap();
+        }
+        set.as_mut().unwrap().insert(id.to_string());
+        Claim(id.to_string())
+    }
+
+    fn try_take(id: &str) -> Option<Claim> {
+        CLAIMED.lock().unwrap().get_or_insert_with(HashSet::new).insert(id.to_string()).then(|| Claim(id.to_string()))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(set) = CLAIMED.lock().unwrap().as_mut() {
+            set.remove(&self.0);
+        }
+        RELEASED.notify_all();
+    }
+}
+
+/// TCP keepalive on a producer's connection: a producer whose machine went down (a reboot sends
+/// nothing) is noticed in about a minute, and its run closes.
+fn keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int, v: libc::c_int| {
+        // SAFETY: setsockopt with a c_int option value on a socket we own.
+        unsafe { libc::setsockopt(fd, level, name, &v as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 30);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+}
+
+/// Close a run: each site's parts into one zstd file.
+fn close(run_dir: &Path) {
+    let t0 = Instant::now();
+    for entry in fs::read_dir(run_dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if let Err(e) = compact(&entry.path()) {
+                eprintln!("prow-server: {}: parts left as they are: {e}", entry.path().display());
+            }
+        }
+    }
+    eprintln!("prow-server: {} closed in {:.1} s", run_dir.display(), t0.elapsed().as_secs_f64());
+}
+
+/// At start, close every run without a connection: those whose connection ended while the server
+/// was down, and runs written before closing compacted them. A run marked open is no longer: its
+/// end is its newest file.
+fn close_idle_runs(data: &Path) {
+    let dirs = |d: &Path, prefix: &str| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix))).collect();
+        v.sort();
+        v
+    };
+    for project in dirs(data, "project=") {
+        for run in dirs(&project, "run=") {
+            let id = run.file_name().unwrap().to_string_lossy()["run=".len()..].to_string();
+            let Some(_claim) = Claim::try_take(&id) else { continue };
+            let files: Vec<PathBuf> = dirs(&run, "").iter().flat_map(|s| fs::read_dir(s).into_iter().flatten().flatten().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "parquet")).collect();
+            let open = files.iter().any(|f| f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("part-")))
+                || files.iter().any(|f| !is_zstd(f).unwrap_or(true));
+            let mut manifest: Map<String, Json> = fs::read(run.join("manifest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            if manifest.get("state").and_then(Json::as_str) == Some("open") {
+                let last = files.iter().filter_map(|f| fs::metadata(f).and_then(|m| m.modified()).ok()).max();
+                let ns = last.and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or_else(now_ns, |d| d.as_nanos() as i64);
+                manifest.insert("state".into(), "disconnected".into());
+                manifest.insert("ended".into(), iso(ns).into());
+                if let Err(e) = write_manifest(&run, &manifest) {
+                    eprintln!("prow-server: {}: {e}", run.display());
+                }
+            }
+            if open {
+                close(&run);
+            }
+        }
     }
 }
 
@@ -440,21 +559,42 @@ fn next_part(site_dir: &Path) -> io::Result<u32> {
 /// Parquet key-value metadata: the last `ROWS` sequence a file's rows come from.
 const SEQ_KEY: &str = "prow.seq";
 
+/// zstd's level for a closed run's files. Reading costs the same at any level, so a run is written
+/// once, hard, when it closes; its parts, written every 5 s while it is open, use Snappy.
+const ZSTD_LEVEL: i32 = 19;
+
+/// How a file is written: `compression`, and a dictionary only for text, which repeats. Numbers
+/// rarely do; a dictionary on unique timestamps made them larger than plain.
+fn props(schema: &ArrowSchema, seq: u64, compression: Compression) -> WriterProperties {
+    let mut b = WriterProperties::builder()
+        .set_compression(compression)
+        .set_key_value_metadata(Some(vec![KeyValue::new(SEQ_KEY.into(), seq.to_string())]));
+    for f in schema.fields() {
+        if !matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(..)) {
+            b = b.set_column_dictionary_enabled(ColumnPath::from(f.name().as_str()), false);
+        }
+    }
+    b.build()
+}
+
 /// Write `batches` to `path` through a synced temporary file and a rename.
 fn write_parquet(path: &Path, batches: &[RecordBatch], seq: u64) -> io::Result<()> {
     let tmp = path.with_file_name(format!(".{}.tmp", path.file_name().unwrap().to_string_lossy()));
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![KeyValue::new(SEQ_KEY.into(), seq.to_string())]))
-        .build();
+    let schema = batches[0].schema();
     let file = fs::File::create(&tmp)?;
-    let mut w = ArrowWriter::try_new(file, batches[0].schema(), Some(props)).map_err(io::Error::other)?;
+    let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props(&schema, seq, Compression::SNAPPY))).map_err(io::Error::other)?;
     for b in batches {
         w.write(b).map_err(io::Error::other)?;
     }
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(tmp, path)?;
     fs::File::open(path.parent().unwrap())?.sync_all()
+}
+
+/// Whether a Parquet file is in zstd throughout: a closed run's file.
+fn is_zstd(path: &Path) -> io::Result<bool> {
+    let b = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?).map_err(io::Error::other)?;
+    Ok(b.metadata().row_groups().iter().flat_map(|g| g.columns()).all(|c| matches!(c.compression(), Compression::ZSTD(_))))
 }
 
 /// A Parquet file's `prow.seq`.
@@ -485,8 +625,8 @@ fn drop_parts_after(run_dir: &Path, durable_seq: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// A site's parts (and an earlier `data.parquet`) into one `data.parquet`, a batch at a time, so a
-/// long run compacts in the memory of one batch.
+/// A site's parts (and an earlier `data.parquet`) into one `data.parquet` in zstd, a batch at a
+/// time, so a long run compacts in the memory of one batch.
 fn compact(site_dir: &Path) -> io::Result<()> {
     let data = site_dir.join("data.parquet");
     let mut parts: Vec<PathBuf> = fs::read_dir(site_dir)?
@@ -497,32 +637,29 @@ fn compact(site_dir: &Path) -> io::Result<()> {
         })
         .collect();
     parts.sort();
-    if parts.is_empty() {
+    if parts.is_empty() && (!data.exists() || is_zstd(&data)?) {
         return Ok(());
-    }
-    if !data.exists() && parts.len() == 1 {
-        return fs::rename(&parts[0], &data);
     }
     let inputs: Vec<&PathBuf> = std::iter::once(&data).filter(|d| d.exists()).chain(parts.iter()).collect();
     let mut seq = 0;
     let mut schema = None;
     for p in &inputs {
         seq = seq.max(file_seq(p)?);
-        let s = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(p)?).map_err(io::Error::other)?.schema().clone();
+        // the fields alone: a part's schema also carries its file's metadata (its `prow.seq`)
+        let s = Arc::new(ArrowSchema::new(ParquetRecordBatchReaderBuilder::try_new(fs::File::open(p)?).map_err(io::Error::other)?.schema().fields().clone()));
         if schema.get_or_insert_with(|| s.clone()) != &s {
             return Err(io::Error::other("the parts have different schemas"));
         }
     }
     let tmp = data.with_file_name(".data.parquet.tmp");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(vec![KeyValue::new(SEQ_KEY.into(), seq.to_string())]))
-        .build();
-    let mut w = ArrowWriter::try_new(fs::File::create(&tmp)?, schema.unwrap(), Some(props)).map_err(io::Error::other)?;
+    let schema = schema.unwrap();
+    let props = props(&schema, seq, Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL).unwrap()));
+    let mut w = ArrowWriter::try_new(fs::File::create(&tmp)?, Arc::clone(&schema), Some(props)).map_err(io::Error::other)?;
     for p in &inputs {
         let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(p)?).map_err(io::Error::other)?.build().map_err(io::Error::other)?;
         for b in reader {
-            w.write(&b.map_err(io::Error::other)?).map_err(io::Error::other)?;
+            let b = b.map_err(io::Error::other)?.with_schema(Arc::clone(&schema)).map_err(io::Error::other)?;
+            w.write(&b).map_err(io::Error::other)?;
         }
     }
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
@@ -579,6 +716,39 @@ mod tests {
     fn iso_to_the_nanosecond() {
         assert_eq!(iso(0), "1970-01-01T00:00:00.000000000Z");
         assert_eq!(iso(1_792_242_425_000_042_999), "2026-10-17T13:07:05.000042999Z");
+    }
+
+    #[test]
+    fn closing_compacts_parts_into_one_zstd_file_and_a_reconnection_continues_it() {
+        let dir = std::env::temp_dir().join(format!("prow-test-close-{}", std::process::id()));
+        let site = dir.join("step");
+        fs::create_dir_all(&site).unwrap();
+        let schema = Schema { site: 1, name: "step".into(), category: "c".into(), fields: vec![("ms".into(), Type::F64)] };
+        let part = |n: u32, seq: u64| {
+            let mut b = SiteBuf::new(schema.clone());
+            b.push(seq as i64, &[Wire::F64(seq as f64)], &HashMap::new()).unwrap();
+            write_parquet(&site.join(format!("part-{n:05}.parquet")), &[b.batch().unwrap()], seq).unwrap();
+        };
+        let rows = || -> usize {
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(site.join("data.parquet")).unwrap()).unwrap().build().unwrap().map(|b| b.unwrap().num_rows()).sum()
+        };
+        let names = || -> Vec<String> {
+            let mut v: Vec<String> = fs::read_dir(&site).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        part(1, 4);
+        part(2, 9);
+        close(&dir);
+        assert_eq!(names(), ["data.parquet"]);
+        assert_eq!((rows(), file_seq(&site.join("data.parquet")).unwrap()), (2, 9));
+        assert!(is_zstd(&site.join("data.parquet")).unwrap());
+        // the producer reconnects: its parts continue the run, and the next close takes them in
+        part(3, 12);
+        close(&dir);
+        assert_eq!(names(), ["data.parquet"]);
+        assert_eq!((rows(), file_seq(&site.join("data.parquet")).unwrap()), (3, 12));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
