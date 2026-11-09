@@ -333,6 +333,8 @@ impl Sender {
                 };
                 st.stop
             };
+            // a (raw, real) pair a flush, for converting raw-clock readings later (clock::from_raw)
+            clock::sample();
             self.collect();
             match stop {
                 None => self.send(),

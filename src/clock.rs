@@ -10,12 +10,16 @@
 //! A card's ticks reach UTC in two steps. KFD reads the card's counter and the host's
 //! `CLOCK_MONOTONIC_RAW` back to back (`AMDKFD_IOC_GET_CLOCK_COUNTERS`). [`Card`] fits a line
 //! through those pairs: the latest pair gives the offset, the first and latest give the rate.
-//! It takes a new pair once a second of conversions. The raw clock goes to UTC through a fresh
-//! `CLOCK_MONOTONIC_RAW` / `CLOCK_REALTIME` pair on every conversion, because NTP slews real
-//! time and never the raw clock.
+//! It takes a new pair once a second of conversions. The card's counter and the raw clock are both
+//! free-running oscillators, so their ratio holds. Real time does not run at the raw clock's rate:
+//! NTP slews it (hundreds of ppm while it absorbs an offset), so the raw clock goes to UTC through
+//! a history of `CLOCK_MONOTONIC_RAW` / `CLOCK_REALTIME` pairs, sampled by the run's sender every
+//! flush, interpolated around each reading. (With one pair taken at conversion, a stamp converted
+//! seconds later sat off by its age times the slew: 0.3 ms over 1.4 s at 230 ppm on one host.)
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 /// A point in time: nanoseconds since the Unix epoch, UTC.
@@ -49,13 +53,49 @@ pub fn raw_now() -> i64 {
     read(libc::CLOCK_MONOTONIC_RAW)
 }
 
-/// A host raw-clock reading (ns of `CLOCK_MONOTONIC_RAW`) as UTC.
-pub fn from_raw(raw: i64) -> Timestamp {
-    // raw, real, raw: the real-time reading sits at the midpoint of the two raw ones
+/// A (raw, real) pair read back to back: the real-time reading sits at the midpoint of two raw ones.
+fn pair() -> (i64, i64) {
     let a = raw_now();
     let real = read(libc::CLOCK_REALTIME);
     let b = raw_now();
-    Timestamp(real + (raw - (a + (b - a) / 2)))
+    (a + (b - a) / 2, real)
+}
+
+/// (raw, real) pairs, oldest first: real time runs at the raw clock's rate only on average (NTP
+/// speeds it up or slows it down, hundreds of ppm while it absorbs an offset), so an old raw
+/// reading converts by the pairs around it, not by today's offset.
+static HISTORY: Mutex<VecDeque<(i64, i64)>> = Mutex::new(VecDeque::new());
+/// Pairs kept: 20 minutes at the sender's 100 ms.
+const HISTORY_LEN: usize = 12_000;
+
+/// Record a (raw, real) pair now. The run's sender does, every flush; `from_raw` does too.
+pub fn sample() -> (i64, i64) {
+    let p = pair();
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if h.back().is_none_or(|&(r, _)| p.0 - r >= 50_000_000) {
+        if h.len() == HISTORY_LEN {
+            h.pop_front();
+        }
+        h.push_back(p);
+    }
+    p
+}
+
+/// A host raw-clock reading (ns of `CLOCK_MONOTONIC_RAW`) as UTC: interpolated between the recorded
+/// pairs around it, so a reading from seconds ago lands where real time was then.
+pub fn from_raw(raw: i64) -> Timestamp {
+    let now = sample();
+    let h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    // the pair at or before `raw`, and the one after it (or now's)
+    let i = h.partition_point(|&(r, _)| r <= raw);
+    let lo = if i == 0 { None } else { Some(h[i - 1]) };
+    let hi = h.get(i).copied().unwrap_or(now);
+    Timestamp(match lo {
+        Some((r0, t0)) if hi.0 > r0 => t0 + ((raw - r0) as f64 * (hi.1 - t0) as f64 / (hi.0 - r0) as f64).round() as i64,
+        Some((r0, t0)) => t0 + (raw - r0),
+        // older than the history: today's offset is the best there is
+        None => hi.1 + (raw - hi.0),
+    })
 }
 
 /// The host clock's synchronisation, as the kernel reports it (`adjtimex(2)`).
